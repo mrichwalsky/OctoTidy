@@ -13,10 +13,6 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-if (class_exists('OctoTidy_Media_Attachment_Verifier')) {
-    return;
-}
-
 final class OctoTidy_Media_Attachment_Verifier {
     private const OPTION_RESULTS = 'octotidy_scan_results';
     private const OPTION_SCANNED_AT = 'octotidy_scanned_at';
