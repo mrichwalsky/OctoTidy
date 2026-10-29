@@ -17,6 +17,16 @@ It adds **Media > OctoTidy Verifier** in WP Admin. Click **Run Verification** to
 - Original attachment URLs and generated image-size files
 - Common ID references such as `wp-image-123`, gallery IDs, `attachment_id`, `image_id`, `thumbnail_id`, and serialized equivalents
 
+## Large Libraries (WP-CLI)
+
+The scan reads the database once in small batches, but a big site can still outlast a web request timeout. Run it over SSH at low priority instead:
+
+```sh
+nice -n 19 wp octotidy scan
+```
+
+Results are saved the same way as a browser run, so review and export them under **Media > OctoTidy Verifier**. Each attachment keeps up to 10 found locations.
+
 ## Bulk Cleanup
 
 After a verification run, OctoTidy can move the current **Likely unused** results to the Media Library Trash. The cleanup form requires a checkbox, typing `DELETE`, and a browser confirmation.

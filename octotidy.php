@@ -2,7 +2,7 @@
 /**
  * Plugin Name: OctoTidy
  * Description: Media Attachment Verifier for finding Media Library assets that are likely unused across posts, meta, options, and builder data.
- * Version: 0.1.4
+ * Version: 0.2.0
  * Author: GM8
  * License: GPL-2.0-or-later
  * Text Domain: octotidy
@@ -20,12 +20,29 @@ final class OctoTidy_Media_Attachment_Verifier {
     private const NONCE_EXPORT_ACTION = 'octotidy_export';
     private const NONCE_DELETE_ACTION = 'octotidy_delete_unused';
     private const REQUIRED_CAPABILITY = 'manage_options';
+    private const BATCH_SIZE = 100;
+    private const MAX_LOCATIONS = 10;
 
     public static function init(): void {
         add_action('admin_menu', [__CLASS__, 'register_admin_page']);
         add_action('admin_post_octotidy_scan', [__CLASS__, 'handle_scan']);
         add_action('admin_post_octotidy_export', [__CLASS__, 'handle_export']);
         add_action('admin_post_octotidy_delete_unused', [__CLASS__, 'handle_delete_unused']);
+
+        if (defined('WP_CLI') && WP_CLI) {
+            WP_CLI::add_command('octotidy scan', [__CLASS__, 'cli_scan'], [
+                'shortdesc' => 'Run the media verification and store results for Media > OctoTidy Verifier.',
+            ]);
+        }
+    }
+
+    public static function cli_scan(): void {
+        $results = self::store_scan();
+        $unused = count(array_filter($results, static function (array $row): bool {
+            return !$row['used'];
+        }));
+
+        WP_CLI::success(sprintf('Checked %d attachments, %d likely unused. Review them under Media > OctoTidy Verifier.', count($results), $unused));
     }
 
     public static function register_admin_page(): void {
@@ -61,6 +78,10 @@ final class OctoTidy_Media_Attachment_Verifier {
             <p><strong><?php echo esc_html__('Media Attachment Verifier', 'octotidy'); ?></strong></p>
             <p>
                 <?php echo esc_html__('This MVP checks common WordPress storage locations for Media Library references. Treat "Likely unused" as review candidates, not automatic delete instructions.', 'octotidy'); ?>
+            </p>
+            <p>
+                <?php echo esc_html__('Large library? Run the check over SSH instead so it cannot time out:', 'octotidy'); ?>
+                <code>nice -n 19 wp octotidy scan</code>
             </p>
 
             <?php if (isset($_GET['octotidy_scanned']) && '1' === sanitize_text_field(wp_unslash($_GET['octotidy_scanned']))) : ?>
@@ -191,9 +212,7 @@ final class OctoTidy_Media_Attachment_Verifier {
 
         check_admin_referer(self::NONCE_SCAN_ACTION);
 
-        $results = self::run_scan();
-        update_option(self::OPTION_RESULTS, $results, false);
-        update_option(self::OPTION_SCANNED_AT, time(), false);
+        self::store_scan();
 
         wp_safe_redirect(add_query_arg('octotidy_scanned', '1', admin_url('upload.php?page=octotidy')));
         exit;
@@ -286,32 +305,42 @@ final class OctoTidy_Media_Attachment_Verifier {
         exit;
     }
 
+    private static function store_scan(): array {
+        $results = self::run_scan();
+        update_option(self::OPTION_RESULTS, $results, false);
+        update_option(self::OPTION_SCANNED_AT, time(), false);
+
+        return $results;
+    }
+
+    /**
+     * Single pass: index attachment files by basename, then stream every haystack once and
+     * look up what it references. Memory stays at one batch of rows plus the attachment index.
+     */
     private static function run_scan(): array {
-        $haystacks = self::collect_haystacks();
-        $attachments = get_posts([
-            'post_type' => 'attachment',
-            'post_status' => 'inherit',
-            'posts_per_page' => -1,
-            'orderby' => 'ID',
-            'order' => 'DESC',
-            'fields' => 'ids',
-        ]);
+        [$attachments, $files, $file_pattern] = self::index_attachments();
+        $locations = [];
+
+        foreach (self::haystacks() as [$label, $value]) {
+            if ($value === '') {
+                continue;
+            }
+
+            foreach (self::referenced_ids(wp_unslash($value), $label, $files, $file_pattern) as $id) {
+                // ponytail: keeps the first MAX_LOCATIONS per attachment so the results option stays small.
+                if (isset($attachments[$id]) && count($locations[$id] ?? []) < self::MAX_LOCATIONS) {
+                    $locations[$id][$label] = true;
+                }
+            }
+        }
 
         $results = [];
 
-        foreach ($attachments as $attachment_id) {
-            $attachment_id = (int) $attachment_id;
-            $needles = self::build_needles($attachment_id);
-            $locations = self::find_locations($attachment_id, $needles, $haystacks);
-            $file = (string) get_post_meta($attachment_id, '_wp_attached_file', true);
-
-            $results[] = [
-                'id' => $attachment_id,
-                'title' => get_the_title($attachment_id) ?: sprintf(__('Attachment #%d', 'octotidy'), $attachment_id),
-                'file' => $file,
-                'type' => (string) get_post_mime_type($attachment_id),
-                'used' => !empty($locations),
-                'locations' => $locations,
+        foreach ($attachments as $id => $attachment) {
+            $found = array_keys($locations[$id] ?? []);
+            $results[] = $attachment + [
+                'used' => !empty($found),
+                'locations' => $found,
             ];
         }
 
@@ -358,160 +387,208 @@ final class OctoTidy_Media_Attachment_Verifier {
         return $normalized;
     }
 
-    private static function collect_haystacks(): array {
+    private static function index_attachments(): array {
         global $wpdb;
 
-        $haystacks = [];
-        $post_rows = $wpdb->get_results(
-            "SELECT ID, post_title, post_type, post_content, post_excerpt FROM {$wpdb->posts} WHERE post_type <> 'attachment' AND post_status NOT IN ('trash', 'auto-draft')",
-            ARRAY_A
+        $attachments = [];
+        $files = [];
+        $extensions = [];
+        $rows = self::paged_rows(
+            "SELECT p.ID AS row_id, p.post_title, p.post_mime_type, f.meta_value AS file, m.meta_value AS metadata
+            FROM {$wpdb->posts} p
+            LEFT JOIN {$wpdb->postmeta} f ON f.post_id = p.ID AND f.meta_key = '_wp_attached_file'
+            LEFT JOIN {$wpdb->postmeta} m ON m.post_id = p.ID AND m.meta_key = '_wp_attachment_metadata'
+            WHERE p.post_type = 'attachment' AND p.post_status = 'inherit'",
+            'p.ID'
         );
 
-        foreach ($post_rows as $row) {
-            $label = sprintf('Post #%d (%s): %s', (int) $row['ID'], $row['post_type'], wp_strip_all_tags((string) $row['post_title']));
-            $haystacks[] = ['label' => $label . ' content', 'value' => (string) $row['post_content']];
-            $haystacks[] = ['label' => $label . ' excerpt', 'value' => (string) $row['post_excerpt']];
+        foreach ($rows as $row) {
+            $id = (int) $row['row_id'];
+            $file = (string) $row['file'];
+            $attachments[$id] = [
+                'id' => $id,
+                'title' => (string) $row['post_title'] !== '' ? (string) $row['post_title'] : sprintf(__('Attachment #%d', 'octotidy'), $id),
+                'file' => $file,
+                'type' => (string) $row['post_mime_type'],
+            ];
+
+            if ($file === '') {
+                continue;
+            }
+
+            $paths = [$file];
+            $metadata = maybe_unserialize((string) $row['metadata']);
+
+            if (is_array($metadata) && !empty($metadata['sizes']) && is_array($metadata['sizes'])) {
+                $dirname = dirname($file) === '.' ? '' : trailingslashit(dirname($file));
+
+                foreach ($metadata['sizes'] as $size) {
+                    if (!empty($size['file'])) {
+                        $paths[] = $dirname . $size['file'];
+                    }
+                }
+            }
+
+            foreach (array_unique($paths) as $path) {
+                $files[wp_basename($path)][] = [$path, $id];
+                $extensions[strtolower(pathinfo($path, PATHINFO_EXTENSION))] = true;
+            }
         }
 
-        $post_meta_rows = $wpdb->get_results(
-            "SELECT pm.post_id AS object_id, pm.meta_key, pm.meta_value
+        unset($extensions['']);
+
+        return [$attachments, $files, self::file_pattern(array_keys($extensions))];
+    }
+
+    /**
+     * Matches file basenames ending in one of the given extensions. The lookbehind only lets a
+     * match start at a token boundary, which keeps long blobs (base64, minified JSON) linear.
+     */
+    private static function file_pattern(array $extensions): string {
+        if (empty($extensions)) {
+            return '';
+        }
+
+        $char = '[^\/\\\\\s"\'<>()=,;?#&|]';
+        $extensions = array_map(static function (string $extension): string {
+            return preg_quote($extension, '/');
+        }, $extensions);
+
+        return '/(?<!' . $char . ')' . $char . '+?\.(?:' . implode('|', $extensions) . ')(?![a-z0-9])/i';
+    }
+
+    private static function haystacks(): Generator {
+        global $wpdb;
+
+        $posts = self::paged_rows(
+            "SELECT ID AS row_id, post_title, post_type, post_content, post_excerpt FROM {$wpdb->posts}
+            WHERE post_type <> 'attachment' AND post_status NOT IN ('trash', 'auto-draft')",
+            'ID'
+        );
+
+        foreach ($posts as $row) {
+            $label = sprintf('Post #%d (%s): %s', (int) $row['row_id'], $row['post_type'], wp_strip_all_tags((string) $row['post_title']));
+            yield [$label . ' content', (string) $row['post_content']];
+            yield [$label . ' excerpt', (string) $row['post_excerpt']];
+        }
+
+        $post_meta = self::paged_rows(
+            "SELECT pm.meta_id AS row_id, pm.post_id AS object_id, pm.meta_key, pm.meta_value
             FROM {$wpdb->postmeta} pm
             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
             WHERE p.post_type <> 'attachment'
             AND p.post_status NOT IN ('trash', 'auto-draft')
             AND pm.meta_key NOT IN ('_wp_attached_file', '_wp_attachment_metadata', '_wp_attachment_image_alt')
             AND pm.meta_key NOT LIKE '\_wp\_attachment\_%'",
-            ARRAY_A
+            'pm.meta_id'
         );
 
-        foreach ($post_meta_rows as $row) {
-            $haystacks[] = [
-                'label' => sprintf('Post meta #%d: %s', (int) $row['object_id'], (string) $row['meta_key']),
-                'value' => (string) $row['meta_value'],
-            ];
+        foreach ($post_meta as $row) {
+            yield [sprintf('Post meta #%d: %s', (int) $row['object_id'], (string) $row['meta_key']), (string) $row['meta_value']];
         }
 
         $meta_tables = [
-            $wpdb->termmeta => ['id_column' => 'term_id', 'key_column' => 'meta_key', 'value_column' => 'meta_value', 'label' => 'Term meta'],
-            $wpdb->commentmeta => ['id_column' => 'comment_id', 'key_column' => 'meta_key', 'value_column' => 'meta_value', 'label' => 'Comment meta'],
+            $wpdb->termmeta => ['term_id', 'Term meta'],
+            $wpdb->commentmeta => ['comment_id', 'Comment meta'],
         ];
 
-        foreach ($meta_tables as $table => $config) {
-            $rows = $wpdb->get_results(
-                "SELECT {$config['id_column']} AS object_id, {$config['key_column']} AS meta_key, {$config['value_column']} AS meta_value FROM {$table}",
-                ARRAY_A
+        foreach ($meta_tables as $table => [$id_column, $table_label]) {
+            $rows = self::paged_rows(
+                "SELECT meta_id AS row_id, {$id_column} AS object_id, meta_key, meta_value FROM {$table} WHERE 1 = 1",
+                'meta_id'
             );
 
             foreach ($rows as $row) {
-                $haystacks[] = [
-                    'label' => sprintf('%s #%d: %s', $config['label'], (int) $row['object_id'], (string) $row['meta_key']),
-                    'value' => (string) $row['meta_value'],
-                ];
+                yield [sprintf('%s #%d: %s', $table_label, (int) $row['object_id'], (string) $row['meta_key']), (string) $row['meta_value']];
             }
         }
 
-        $options = $wpdb->get_results(
-            "SELECT option_name, option_value FROM {$wpdb->options}
+        $options = self::paged_rows(
+            "SELECT option_id AS row_id, option_name, option_value FROM {$wpdb->options}
             WHERE option_name NOT LIKE '\_transient\_%'
             AND option_name NOT LIKE '\_site\_transient\_%'
             AND option_name NOT LIKE 'octotidy\_%'",
-            ARRAY_A
+            'option_id'
         );
 
         foreach ($options as $row) {
-            $haystacks[] = [
-                'label' => sprintf('Option: %s', (string) $row['option_name']),
-                'value' => (string) $row['option_value'],
-            ];
+            yield [sprintf('Option: %s', (string) $row['option_name']), (string) $row['option_value']];
         }
-
-        return array_values(array_filter($haystacks, static function (array $haystack): bool {
-            return $haystack['value'] !== '';
-        }));
     }
 
-    private static function build_needles(int $attachment_id): array {
-        $needles = [];
-        $url = wp_get_attachment_url($attachment_id);
-        $file = (string) get_post_meta($attachment_id, '_wp_attached_file', true);
-        $uploads = wp_get_upload_dir();
+    /**
+     * Keyset-paged rows, so only one batch is ever in memory. $sql must select the id column
+     * as row_id and end in a WHERE clause.
+     */
+    private static function paged_rows(string $sql, string $id_column): Generator {
+        global $wpdb;
 
-        if ($url) {
-            $needles[] = $url;
-            $needles[] = set_url_scheme($url, 'http');
-            $needles[] = set_url_scheme($url, 'https');
-            $needles[] = wp_parse_url($url, PHP_URL_PATH);
-        }
+        $last_id = 0;
 
-        if ($file !== '') {
-            $needles[] = $file;
-            $needles[] = trailingslashit((string) $uploads['baseurl']) . ltrim($file, '/');
-            $needles[] = trailingslashit((string) wp_parse_url((string) $uploads['baseurl'], PHP_URL_PATH)) . ltrim($file, '/');
-        }
+        do {
+            // ponytail: fixed row count, not bytes; lower BATCH_SIZE if huge builder rows still spike memory.
+            $rows = $wpdb->get_results(
+                $sql . ' AND ' . $id_column . ' > ' . $last_id . ' ORDER BY ' . $id_column . ' LIMIT ' . self::BATCH_SIZE,
+                ARRAY_A
+            );
 
-        $metadata = wp_get_attachment_metadata($attachment_id);
-        if (is_array($metadata) && !empty($metadata['sizes']) && is_array($metadata['sizes'])) {
-            $dirname = $file ? trailingslashit(dirname($file)) : '';
-
-            foreach ($metadata['sizes'] as $size) {
-                if (empty($size['file'])) {
-                    continue;
-                }
-
-                $variant = $dirname . $size['file'];
-                $needles[] = $variant;
-                $needles[] = trailingslashit((string) $uploads['baseurl']) . ltrim($variant, '/');
-                $needles[] = trailingslashit((string) wp_parse_url((string) $uploads['baseurl'], PHP_URL_PATH)) . ltrim($variant, '/');
+            // A failed query must not look like "no references", or everything reads as unused.
+            if ($wpdb->last_error !== '') {
+                throw new RuntimeException('OctoTidy scan query failed: ' . $wpdb->last_error);
             }
-        }
 
-        return array_values(array_unique(array_filter(array_map('strval', $needles))));
+            $rows = $rows ?: [];
+
+            foreach ($rows as $row) {
+                yield $row;
+            }
+
+            if ($rows) {
+                $last_id = (int) end($rows)['row_id'];
+            }
+        } while (count($rows) === self::BATCH_SIZE);
     }
 
-    private static function find_locations(int $attachment_id, array $needles, array $haystacks): array {
-        $locations = [];
+    private static function referenced_ids(string $value, string $label, array $files, string $file_pattern): array {
+        $ids = [];
 
-        foreach ($haystacks as $haystack) {
-            $value = wp_unslash((string) $haystack['value']);
-
-            foreach ($needles as $needle) {
-                if ($needle !== '' && strpos($value, $needle) !== false) {
-                    $locations[] = $haystack['label'];
-                    continue 2;
+        if ($file_pattern !== '' && preg_match_all($file_pattern, $value, $matches)) {
+            foreach (array_unique($matches[0]) as $basename) {
+                foreach ($files[$basename] ?? [] as [$path, $id]) {
+                    if (strpos($value, $path) !== false) {
+                        $ids[] = $id;
+                    }
                 }
             }
-
-            if (self::contains_attachment_id_reference($value, $attachment_id, (string) $haystack['label'])) {
-                $locations[] = $haystack['label'];
-            }
         }
 
-        return array_values(array_unique($locations));
-    }
-
-    private static function contains_attachment_id_reference(string $value, int $attachment_id, string $label): bool {
-        $label_looks_media_related = preg_match('/(?:image|media|attachment|thumbnail|logo|icon|gallery|background|avatar|file)/i', $label);
-
-        if ($label_looks_media_related && preg_match('/(?:^|[^\d])' . preg_quote((string) $attachment_id, '/') . '(?:[^\d]|$)/', trim($value))) {
-            return true;
-        }
-
-        $id = preg_quote((string) $attachment_id, '/');
+        $keys = 'id|image|image_id|attachment_id|media|media_id|thumbnail_id|background_image';
         $patterns = [
-            '/wp-image-' . $id . '\b/',
-            '/\bids=(["\']?)[^"\']*\b' . $id . '\b[^"\']*\1/',
-            '/["\'](?:id|image|image_id|attachment_id|media|media_id|thumbnail_id|background_image)["\']\s*[:=]\s*["\']?' . $id . '\b/',
-            '/(?:s:\d+:"(?:id|image|image_id|attachment_id|media|media_id|thumbnail_id|background_image)";i:)' . $id . ';/',
-            '/(?:s:\d+:"(?:id|image|image_id|attachment_id|media|media_id|thumbnail_id|background_image)";s:\d+:"' . $id . '";)/',
+            '/wp-image-(\d+)\b/',
+            '/["\'](?:' . $keys . ')["\']\s*[:=]\s*["\']?(\d+)\b/',
+            '/s:\d+:"(?:' . $keys . ')";i:(\d+);/',
+            '/s:\d+:"(?:' . $keys . ')";s:\d+:"(\d+)";/',
         ];
 
         foreach ($patterns as $pattern) {
-            if (preg_match($pattern, $value)) {
-                return true;
+            if (preg_match_all($pattern, $value, $matches)) {
+                $ids = array_merge($ids, $matches[1]);
             }
         }
 
-        return false;
+        if (preg_match_all('/\bids=(["\']?)([^"\']*)\1/', $value, $matches)) {
+            foreach ($matches[2] as $list) {
+                preg_match_all('/\d+/', $list, $digits);
+                $ids = array_merge($ids, $digits[0]);
+            }
+        }
+
+        // Any standalone number counts when the location's name looks media related.
+        if (preg_match('/(?:image|media|attachment|thumbnail|logo|icon|gallery|background|avatar|file)/i', $label) && preg_match_all('/\d+/', $value, $matches)) {
+            $ids = array_merge($ids, $matches[0]);
+        }
+
+        return array_unique(array_map('intval', $ids));
     }
 
     private static function escape_csv_cell(string $value): string {
